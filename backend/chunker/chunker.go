@@ -267,6 +267,22 @@ If meta format is set to "none", rename transactions will always be used.
 This method is EXPERIMENTAL, don't use on production systems.`,
 				},
 			},
+		}, {
+			Name:     "keep_old_chunks",
+			Advanced: true,
+			Default:  false,
+			Help: `Choose how chunker should handle the file operation once all chunks have been
+uploaded. If transactions is set to norename, this option has no effect.`,
+			Examples: []fs.OptionExample{
+				{
+					Value: "true",
+					Help: `If new and old chunks are the same, remove the new chunk, keeping the
+old chunk untouched.`,
+				}, {
+					Value: "false",
+					Help:  `Delete all old chunks and rename new chunks.`,
+				},
+			},
 		}},
 	})
 }
@@ -363,14 +379,15 @@ func NewFs(ctx context.Context, name, rpath string, m configmap.Mapper) (fs.Fs, 
 
 // Options defines the configuration for this backend
 type Options struct {
-	Remote       string        `config:"remote"`
-	ChunkSize    fs.SizeSuffix `config:"chunk_size"`
-	NameFormat   string        `config:"name_format"`
-	StartFrom    int           `config:"start_from"`
-	MetaFormat   string        `config:"meta_format"`
-	HashType     string        `config:"hash_type"`
-	FailHard     bool          `config:"fail_hard"`
-	Transactions string        `config:"transactions"`
+	Remote        string        `config:"remote"`
+	ChunkSize     fs.SizeSuffix `config:"chunk_size"`
+	NameFormat    string        `config:"name_format"`
+	StartFrom     int           `config:"start_from"`
+	MetaFormat    string        `config:"meta_format"`
+	HashType      string        `config:"hash_type"`
+	FailHard      bool          `config:"fail_hard"`
+	Transactions  string        `config:"transactions"`
+	KeepOldChunks bool          `config:"keep_old_chunks"`
 }
 
 // Fs represents a wrapped fs.Fs
@@ -1289,20 +1306,59 @@ func (f *Fs) put(
 		return nil, fmt.Errorf("incorrect chunks size %d != %d", sizeTotal, c.readCount)
 	}
 
-	// If previous object was chunked, remove its chunks
-	f.removeOldChunks(ctx, baseRemote)
+	// Check the old object exists - if this is a brand new upload, we can't keep old chunks
+	oldFsObject, err := f.NewObject(ctx, remote)
+	if err == nil && f.opt.KeepOldChunks && !f.useNoRename {
+		// TODO check if hashing is enabled on this backend first
 
-	if !f.useNoRename {
-		// The transaction suffix will be removed for backends with quick rename operations
-		for chunkNo, chunk := range c.chunks {
-			chunkRemote := f.makeChunkName(baseRemote, chunkNo, "", "")
-			chunkMoved, errMove := f.baseMove(ctx, chunk, chunkRemote, delFailed)
-			if errMove != nil {
-				return nil, errMove
+		oldObject := oldFsObject.(*Object)
+		for chunkNo, newChunk := range c.chunks {
+			oldChunk := oldObject.chunks[chunkNo]
+			// TODO make this dependant on the hash type
+			newChunkHash, _ := newChunk.Hash(ctx, hash.MD5)
+			oldChunkHash, _ := oldChunk.Hash(ctx, hash.MD5)
+
+			if newChunkHash == oldChunkHash {
+				// new and old are the same, just remove the new
+				if err := newChunk.Remove(ctx); err != nil {
+					fs.Errorf(newChunk, "Failed to remove new chunk: %v", err)
+				}
+
+			} else {
+				// new and old are different, remove old chunk and move new to old
+				if err := oldChunk.Remove(ctx); err != nil {
+					fs.Errorf(oldChunk, "Failed to remove old chunk: %v", err)
+				}
+
+				chunkRemote := f.makeChunkName(baseRemote, chunkNo, "", "")
+				chunkMoved, errMove := f.baseMove(ctx, newChunk, chunkRemote, delFailed)
+				if errMove != nil {
+					return nil, errMove
+				}
+				c.chunks[chunkNo] = chunkMoved
 			}
-			c.chunks[chunkNo] = chunkMoved
 		}
-		xactID = ""
+
+		// TODO if len(oldObject.chunks > c.chunks), remove spare chunks
+
+	} else {
+
+		// If previous object was chunked, remove its chunks
+		f.removeOldChunks(ctx, baseRemote)
+
+		if !f.useNoRename {
+			// The transaction suffix will be removed for backends with quick rename operations
+			for chunkNo, chunk := range c.chunks {
+				chunkRemote := f.makeChunkName(baseRemote, chunkNo, "", "")
+				chunkMoved, errMove := f.baseMove(ctx, chunk, chunkRemote, delFailed)
+				if errMove != nil {
+					return nil, errMove
+				}
+				c.chunks[chunkNo] = chunkMoved
+			}
+			xactID = ""
+		}
+
 	}
 
 	if !f.useMeta {
